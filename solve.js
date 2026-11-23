@@ -1088,8 +1088,6 @@ function inlineRenderer(state) {
   }
 
   function token(match) {
-    // Only the HTML entity branch of INLINE_TOKEN matches one character.
-    if (match.length === 1) return ESCAPES[match];
     switch (match.charCodeAt(0)) {
       case 92: return match.charCodeAt(1) === 62 ? '&gt;' : match[1];
       case 96: return '<code>' + escapeHtml(match.slice(1, -1)) + '</code>';
@@ -1102,7 +1100,7 @@ function inlineRenderer(state) {
         const close = findUnescaped(match, ']', 1, match.length);
         return link(match.slice(close + 2, -1), state) + inline(match.slice(1, close)) + '</a>';
       }
-      default: return match;
+      default: return ESCAPES[match];
     }
   }
   return inline;
