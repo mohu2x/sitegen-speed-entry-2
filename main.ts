@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
@@ -22,18 +22,12 @@ function scalarToken(value: number | boolean | null): string {
   return 'null';
 }
 
-function serialize(answers: OutputTree[]): Buffer {
-  // Reserve from code-unit lengths with headroom for escapes and multibyte UTF-8.
-  // Reuse these key lists to write in JSON.stringify's property order.
-  const keyLists = answers.map((tree) => Object.keys(tree));
-  let estimate = 2;
-  for (let i = 0; i < answers.length; i++) {
-    const tree = answers[i];
-    estimate += 3 + keyLists[i].length * 6;
-    for (const key of keyLists[i]) {
-      const value = tree[key];
-      estimate += key.length + (typeof value === 'string' ? value.length : 24);
-    }
+function serialize(tree: OutputTree): Buffer {
+  const keys = Object.keys(tree);
+  let estimate = 2 + keys.length * 6;
+  for (const key of keys) {
+    const value = tree[key];
+    estimate += key.length + (typeof value === 'string' ? value.length : 24);
   }
 
   let buffer = Buffer.allocUnsafe(estimate + Math.ceil(estimate / 8));
@@ -63,30 +57,22 @@ function serialize(answers: OutputTree[]): Buffer {
     if (raw) buffer[offset++] = 34; // "
   }
 
-  buffer[offset++] = 91; // [
-  for (let i = 0; i < answers.length; i++) {
-    reserve(4);
-    if (i !== 0) buffer[offset++] = 44; // ,
-    buffer[offset++] = 123; // {
-    const tree = answers[i];
-    const keys = keyLists[i];
-    for (let j = 0; j < keys.length; j++) {
-      const key = keys[j];
-      if (j !== 0) buffer[offset++] = 44; // ,
-      writeString(key);
-      buffer[offset++] = 58; // :
-      const value = tree[key];
-      if (typeof value === 'string') {
-        writeString(value);
-      } else {
-        const token = scalarToken(value);
-        reserve(token.length + 4);
-        offset += buffer.write(token, offset, token.length, 'ascii');
-      }
+  buffer[offset++] = 123; // {
+  for (let j = 0; j < keys.length; j++) {
+    const key = keys[j];
+    if (j !== 0) buffer[offset++] = 44; // ,
+    writeString(key);
+    buffer[offset++] = 58; // :
+    const value = tree[key];
+    if (typeof value === 'string') {
+      writeString(value);
+    } else {
+      const token = scalarToken(value);
+      reserve(token.length + 4);
+      offset += buffer.write(token, offset, token.length, 'ascii');
     }
-    buffer[offset++] = 125; // }
   }
-  buffer[offset++] = 93; // ]
+  buffer[offset++] = 125; // }
 
   const last = buffer.subarray(0, offset);
   if (chunks.length === 0) return last;
@@ -94,9 +80,17 @@ function serialize(answers: OutputTree[]): Buffer {
   return Buffer.concat(chunks, sealedBytes + offset);
 }
 
-const inputText = readFileSync(join(INPUT_DIR, 'cases.json')).toString('utf8');
-const cases = JSON.parse(inputText) as { id: string; input: unknown }[];
-const answers: OutputTree[] = [];
-for (const c of cases) answers.push(run(c.input));
-const output = serialize(answers);
-writeFileSync(join(OUTPUT_DIR, 'answers.json'), output);
+const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json')).toString('utf8')) as { input: unknown }[];
+const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
+try {
+  writeFileSync(fd, '[');
+  for (let i = 0; i < cases.length; i++) {
+    if (i !== 0) writeFileSync(fd, ',');
+    const tree = run(cases[i].input);
+    cases[i].input = null;
+    writeFileSync(fd, serialize(tree));
+  }
+  writeFileSync(fd, ']');
+} finally {
+  closeSync(fd);
+}
