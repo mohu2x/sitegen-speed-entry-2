@@ -24,17 +24,12 @@ const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&
 /** `text` with & < > " and ' escaped. */
 const HTML_SPECIAL = /[&<>"']/g;
 
+function escapeEntity(ch) {
+  return ESCAPES[ch];
+}
+
 function escapeHtml(text) {
-  HTML_SPECIAL.lastIndex = 0;
-  if (!HTML_SPECIAL.test(text)) return text;
-  let out = '';
-  let start = 0;
-  do {
-    const end = HTML_SPECIAL.lastIndex;
-    out += text.slice(start, end - 1) + ESCAPES[text[end - 1]];
-    start = end;
-  } while (HTML_SPECIAL.test(text));
-  return out + text.slice(start);
+  return text.replace(HTML_SPECIAL, escapeEntity);
 }
 
 /** The most characters a slug keeps before a collision suffix. */
@@ -45,13 +40,18 @@ const SLUG_MAX = 64;
  * "-", none at either end, at most SLUG_MAX characters (a "-" left at the cut dropped), and "untitled" when nothing is
  * left.
  */
-function slugify(text) {
+function slugify(text, memo) {
+  const cached = memo.get(text);
+  if (cached !== undefined) return cached;
+  const key = text;
   if (/[^\x00-\x7F]/.test(text)) text = text.normalize('NFKD').replace(/\p{M}/gu, '');
   const slug = text.replace(/[^A-Za-z0-9]+/g, '-');
   const start = slug[0] === '-' ? 1 : 0;
   let end = Math.min(slug.length, start + SLUG_MAX);
   if (slug[end - 1] === '-') end--;
-  return slug.slice(start, end).toLowerCase() || 'untitled';
+  const result = slug.slice(start, end).toLowerCase() || 'untitled';
+  memo.set(key, result);
+  return result;
 }
 
 /** `slug` made unique against `taken` (and added to it): the first of slug, slug-2, slug-3 ... not taken. */
@@ -72,10 +72,13 @@ function uniqueSlug(slug, taken) {
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+function twoDigits(text, offset) {
+  return (text.charCodeAt(offset) - 48) * 10 + text.charCodeAt(offset + 1) - 48;
+}
+
 /** A YYYY-MM-DD date in words, from the string alone: "2026-11-09" is "9 November 2026". */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  return twoDigits(date, 8) + ' ' + MONTHS[twoDigits(date, 5) - 1] + ' ' + date.slice(0, 4);
 }
 
 // makefun-site's front matter (README-reference.md, "Front matter"): a strict subset of YAML's block mappings, its own. A source
@@ -83,75 +86,83 @@ function longDate(date) {
 // ("#" first) or "key: value" with one space after the colon. Seven keys are known, each with its own value grammar,
 // and anything else refuses the file with the first reason met, line by line.
 
-/** The keys a source's front matter may give. */
-const KEYS = Object.freeze(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
-
-const LINE = /^([a-z_]+):(?: (.*))?$/;
-const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const FRONT_KEY = /^[a-z_]+$/;
+const FRONT_LINE_BREAK = /[\u2028\u2029]/;
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const NAME = /^[a-z0-9-]+$/;
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const DATE_ERROR = 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)';
 const TAG = /^[^"[\]]+$/;
 
 /** The days of month `m` (1-12) of year `y`, by the Gregorian rule. */
 function daysIn(y, m) {
   if (m === 2) return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28;
-  return [4, 6, 9, 11].includes(m) ? 30 : 31;
+  return m === 4 || m === 6 || m === 9 || m === 11 ? 30 : 31;
 }
 
 /** A string value: "..." with \" and \\ its only escapes, or bare, the rest of the line (never opening on " or [). */
 function stringOf(raw) {
-  if (raw.startsWith('"')) {
-    if (raw.length < 2 || !raw.endsWith('"')) return { error: 'a quoted string is not closed' };
+  if (raw.charCodeAt(0) === 34) {
+    const end = raw.length - 1;
+    if (end === 0 || raw.charCodeAt(end) !== 34) return { error: 'a quoted string is not closed' };
+    if (raw.indexOf('"', 1) === end && !raw.includes('\\')) return raw.slice(1, end);
     let out = '';
-    for (let i = 1; i < raw.length - 1; i++) {
-      const c = raw[i];
-      if (c === '\\') {
-        const n = raw[i + 1];
-        if ((n !== '"' && n !== '\\') || i + 1 === raw.length - 1) return { error: 'a quoted string holds an escape other than \\" or \\\\' };
-        out += n;
-        i++;
-      } else if (c === '"') return { error: 'a quoted string holds a stray quote' };
-      else out += c;
+    let start = 1;
+    for (let i = 1; i < end; i++) {
+      const ch = raw.charCodeAt(i);
+      if (ch === 92) {
+        const next = raw.charCodeAt(i + 1);
+        if ((next !== 34 && next !== 92) || i + 1 === end) return { error: 'a quoted string holds an escape other than \\" or \\\\' };
+        out += raw.slice(start, i) + raw[++i];
+        start = i + 1;
+      } else if (ch === 34) return { error: 'a quoted string holds a stray quote' };
     }
-    return { value: out };
+    return out + raw.slice(start, end);
   }
-  if (raw.startsWith('[')) return { error: 'a bare string opens on [' };
-  return { value: raw };
+  if (raw.charCodeAt(0) === 91) return { error: 'a bare string opens on [' };
+  return raw;
 }
 
-/** One key's value, or why it is refused. */
-function valueOf(key, raw) {
+/** Store a parsed value, or return the reason it is refused. */
+function storeValue(data, key, raw) {
+  let value = raw;
   switch (key) {
     case 'title':
-    case 'summary': {
-      const s = stringOf(raw);
-      return 'error' in s ? { error: `key "${key}": ${s.error}` } : s;
-    }
+    case 'summary':
+      value = stringOf(raw);
+      if (typeof value !== 'string') return `key "${key}": ${value.error}`;
+      break;
     case 'date': {
-      const m = DATE.exec(raw);
-      const y = m ? Number(m[1]) : 0;
-      const mo = m ? Number(m[2]) : 0;
-      const d = m ? Number(m[3]) : 0;
-      if (!m || y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo)) return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
-      return { value: raw };
+      if (!DATE.test(raw)) return DATE_ERROR;
+      const y = twoDigits(raw, 0) * 100 + twoDigits(raw, 2);
+      const m = twoDigits(raw, 5);
+      const d = twoDigits(raw, 8);
+      if (y < 1970 || y > 2099 || m < 1 || m > 12 || d < 1 || d > daysIn(y, m)) return DATE_ERROR;
+      break;
     }
     case 'tags': {
-      if (!raw.startsWith('[') || !raw.endsWith(']')) return { error: 'key "tags": not a list [a, b]' };
+      if (!raw.startsWith('[') || !raw.endsWith(']')) return 'key "tags": not a list [a, b]';
       const inner = raw.slice(1, -1);
-      if (inner.trim() === '') return { value: [] };
-      const tags = inner.split(',').map((t) => t.trim());
-      if (tags.some((t) => t === '' || !TAG.test(t))) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
-      return { value: tags };
+      value = inner.trim() === '' ? [] : inner.split(',');
+      for (let i = 0; i < value.length; i++) {
+        const tag = value[i].trim();
+        if (tag === '' || !TAG.test(tag)) return 'key "tags": an empty tag, or one holding " [ or ]';
+        value[i] = tag;
+      }
+      break;
     }
     case 'draft':
-      return raw === 'true' ? { value: true } : raw === 'false' ? { value: false } : { error: 'key "draft": true or false' };
+      if (raw !== 'true' && raw !== 'false') return 'key "draft": true or false';
+      value = raw === 'true';
+      break;
     case 'layout':
-      return NAME.test(raw) ? { value: raw } : { error: 'key "layout": not a template name' };
+      if (!NAME.test(raw)) return 'key "layout": not a template name';
+      break;
     case 'slug':
-      return SLUG.test(raw) && raw.length <= 64 ? { value: raw } : { error: 'key "slug": not a slug' };
-    default:
-      return { error: `unknown key "${key}"` };
+      if (raw.length > 64 || !SLUG.test(raw)) return 'key "slug": not a slug';
+      break;
   }
+  data[key] = value;
 }
 
 /**
@@ -166,25 +177,34 @@ function parseFrontMatter(text) {
     close = text.length - 4;
     if (close < 3 || !text.endsWith('\n---')) return { error: 'the front matter is not closed' };
   }
-  const lines = text.slice(0, close).split('\n');
-  const data = {};
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^[ \t]*$/.test(line) || line.startsWith('#')) continue;
-    const m = LINE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
-    const key = m[1];
-    let raw = m[2] ?? '';
-    const last = raw.charCodeAt(raw.length - 1);
-    if (last === 32 || last === 9) raw = raw.replace(TRAILING_SPACE, '');
-    if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
-    if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
+  const data = { title: undefined, date: undefined, tags: undefined, draft: undefined, layout: undefined, slug: undefined, summary: undefined };
+  let next = 4;
+  let line = 1;
+  while (next < close) {
+    const start = next;
+    const end = text.indexOf('\n', start);
+    next = end + 1;
+    line++;
+    const first = text.charCodeAt(start);
+    if (first === 35 || start === end || ((first === 32 || first === 9) && trimStart(text, start + 1, end) === end)) continue;
+    const colon = text.indexOf(':', start);
+    if (colon <= start || colon >= end || (colon + 1 < end && text.charCodeAt(colon + 1) !== 32)) {
+      return { error: `line ${line} is not "key: value"` };
+    }
+    const key = text.slice(start, colon);
+    const valueStart = colon + 2;
+    const raw = valueStart >= end ? '' : text.slice(valueStart, trimEnd(text, valueStart, end));
+    if (FRONT_LINE_BREAK.test(raw)) return { error: `line ${line} is not "key: value"` };
+    if (!Object.hasOwn(data, key)) {
+      if (!FRONT_KEY.test(key)) return { error: `line ${line} is not "key: value"` };
+      return { error: `unknown key "${key}"` };
+    }
+    if (data[key] !== undefined) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
-    const v = valueOf(key, raw);
-    if ('error' in v) return v;
-    data[key] = v.value;
+    const error = storeValue(data, key, raw);
+    if (error !== undefined) return { error };
   }
-  if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
+  if (data.title === undefined) return { error: 'no title' };
   return { data, body: text.slice(close + 5) };
 }
 
@@ -304,9 +324,20 @@ function parseTemplate(name, src) {
 
 const DYNAMIC = Symbol();
 const COMPILE_LIMIT = Symbol();
+const SOURCE_READING = Symbol();
 
 function own(value, key) {
   return value !== null && typeof value === 'object' && Object.hasOwn(value, key) ? value[key] : undefined;
+}
+
+function readingOf(value) {
+  const source = own(value, 'reading_minutes');
+  if (source?.[SOURCE_READING] === undefined) return source;
+  return source[SOURCE_READING] ||= readingMinutes(source.body);
+}
+
+function templateField(value, key) {
+  return key === 'reading_minutes' ? readingOf(value) : own(value, key);
 }
 
 function lookup(scope, path) {
@@ -315,7 +346,7 @@ function lookup(scope, path) {
   while (s !== null && !Object.hasOwn(s.vars, first)) s = s.parent;
   if (s === null) return undefined;
   let value = s.vars[first];
-  for (let i = 1; i < path.length && value !== DYNAMIC; i++) value = own(value, path[i]);
+  for (let i = 1; i < path.length && value !== DYNAMIC; i++) value = templateField(value, path[i]);
   return value;
 }
 
@@ -420,20 +451,24 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
     let expr = bindings.get(path[0]);
     if (expr === undefined) {
       let value = own(globals, path[0]);
-      for (let i = 1; i < path.length; i++) value = own(value, path[i]);
+      for (let i = 1; i < path.length; i++) value = templateField(value, path[i]);
       if (value === undefined) return 'undefined';
       const index = fixed.push(value) - 1;
       return 'fixed[' + index + ']';
     }
     usedBindings.add(expr);
-    for (let i = 1; i < path.length; i++) expr = 'own(' + expr + ',' + JSON.stringify(path[i]) + ')';
+    for (let i = 1; i < path.length; i++) {
+      const key = path[i];
+      expr = key === 'reading_minutes' ? 'readingOf(' + expr + ')' : 'own(' + expr + ',' + JSON.stringify(key) + ')';
+    }
     return expr;
   }
 
   let literal = '';
   function flushLiteral() {
     if (literal !== '') {
-      pending.push(JSON.stringify(literal));
+      if (literal.length > 256) pending.push('fixed[' + (fixed.push(literal) - 1) + ']');
+      else pending.push(JSON.stringify(literal));
       literal = '';
     }
   }
@@ -547,9 +582,9 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
     emit(nodes, roots, scope, startDepth);
     if (source.length === 0 && pending.length === 0) return () => literal;
     flush();
-    const factory = new Function('own', 'textOf', 'escaped', 'truthy', 'loopInfo', 'fixed',
+    const factory = new Function('own', 'readingOf', 'textOf', 'escaped', 'truthy', 'loopInfo', 'fixed',
       '"use strict";return function render(root){let out="";\n' + source.join('\n') + '\nreturn out;}');
-    return factory(own, textOf, escaped, truthy, loopInfo, fixed);
+    return factory(own, readingOf, textOf, escaped, truthy, loopInfo, fixed);
   } catch (err) {
     if (err !== COMPILE_LIMIT && !(err instanceof RangeError) && !(err instanceof SyntaxError)) throw err;
     const parent = { vars: globals, parent: null };
@@ -661,9 +696,21 @@ for (const ch of ' \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2
 }
 
 function readingMinutes(text) {
+  const length = text.length;
+  // Even alternating one-character words and separators cannot exceed 200.
+  if (length <= 399) return 1;
   let words = 0;
   let separated = 1;
-  for (let i = 0; i < text.length; i++) {
+  let i = 0;
+  for (; i + 4 <= length; i += 4) {
+    const a = WORD_SPACE[text.charCodeAt(i)];
+    const b = WORD_SPACE[text.charCodeAt(i + 1)];
+    const c = WORD_SPACE[text.charCodeAt(i + 2)];
+    const d = WORD_SPACE[text.charCodeAt(i + 3)];
+    words += (separated & (a ^ 1)) + (a & (b ^ 1)) + (b & (c ^ 1)) + (c & (d ^ 1));
+    separated = d;
+  }
+  for (; i < length; i++) {
     const space = WORD_SPACE[text.charCodeAt(i)];
     words += separated & (space ^ 1);
     separated = space;
@@ -671,9 +718,29 @@ function readingMinutes(text) {
   return Math.max(1, Math.ceil(words / 200));
 }
 
-/** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
+const PATH_SEGMENT = /(?:^|\/)\.{1,2}(?:\/|$)|\/$|\/\//;
+
+/** Resolve a source-relative link, returning null for a climb above the root. */
 function resolvePath(dir, rel) {
-  if (!/(?:^|\/)\.{1,2}(?:\/|$)|\/$|\/\//.test(rel)) return dir === '' ? rel : dir + '/' + rel;
+  if (rel.indexOf('/') === -1) {
+    if (rel === '.') return dir;
+    if (rel === '..') return dir === '' ? null : dirOf(dir);
+    return dir === '' ? rel : dir + '/' + rel;
+  }
+  let start = 0;
+  if (!dir.startsWith('/')) {
+    while (start < rel.length && rel.charCodeAt(start) === 46) {
+      if (rel.startsWith('./', start)) start += 2;
+      else if (rel.startsWith('../', start)) {
+        if (dir === '') return null;
+        dir = dirOf(dir);
+        start += 3;
+      } else break;
+    }
+  }
+  if (start !== 0) rel = rel.slice(start);
+  if (rel === '') return dir;
+  if (rel.charCodeAt(0) !== 47 && !PATH_SEGMENT.test(rel)) return dir === '' ? rel : dir + '/' + rel;
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -737,9 +804,13 @@ function readSources(b) {
       names = new Map();
       taken.set(outputParent, names);
     }
-    const slug = uniqueSlug(data.slug ?? slugify(data.title), names);
+    const slug = uniqueSlug(data.slug ?? slugify(data.title, b.slugs), names);
     const outDir = outputParent === '' ? slug : outputParent + '/' + slug;
-    const source = { path, dir, data, body, post, layout, slug, outDir, url: b.base + '/' + outDir + '/' };
+    const source = {
+      path, dir, data, body, post, layout, slug, outDir, url: b.base + '/' + outDir + '/',
+      html: '', toc: null, excerpt: '', newer: null, older: null, tagRefs: null, card: null,
+      [SOURCE_READING]: 0,
+    };
     b.sources.push(source);
     if (post) b.posts.push(source);
     b.bySource.set(path, source);
@@ -747,44 +818,55 @@ function readSources(b) {
 }
 
 /** Each body's Markdown, with links to built pages and static files resolved. */
+const LINK_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+function link(target, state) {
+  const { b, dir, staticPaths, targets } = state;
+  let opening = targets.get(target);
+  if (opening === undefined) {
+    let url = target;
+    let broken = false;
+    const first = target.charCodeAt(0);
+    if (first !== 35 && first !== 47 && (target.indexOf(':') === -1 || !LINK_SCHEME.test(target))) {
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const path = resolvePath(dir, rel);
+      const page = path === null ? undefined : b.bySource.get(path);
+      if (page !== undefined) url = page.url;
+      else if (path !== null && staticPaths.has(path)) url = b.base + '/' + path;
+      else broken = true;
+      if (!broken && hash !== -1) url += target.slice(hash);
+    }
+    const tag = '<a href="' + escapeHtml(url) + '">';
+    // A cached unresolved target still contributes a diagnostic for each source.
+    opening = broken ? [tag] : tag;
+    targets.set(target, opening);
+  }
+  if (typeof opening === 'string') return opening;
+  b.broken.add(state.brokenPrefix + target);
+  return opening[0];
+}
+
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
   const byDirectory = new Map();
+  const parts = [];
+  const state = { b, staticPaths, dir: null, targets: null, brokenPrefix: '' };
+
+  const inline = inlineRenderer(state);
   for (const source of b.sources) {
     const dir = source.dir;
-    let targets = byDirectory.get(dir);
-    if (targets === undefined) {
-      targets = new Map();
-      byDirectory.set(dir, targets);
-    }
-    const link = (target) => {
-      if (target[0] === '/' || target[0] === '#') return target;
-      let url = targets.get(target);
-      if (url === undefined) {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)) {
-          url = target;
-        } else {
-          const hash = target.indexOf('#');
-          const rel = hash === -1 ? target : target.slice(0, hash);
-          const fragment = hash === -1 ? '' : target.slice(hash);
-          const path = resolvePath(dir, rel);
-          if (path === null) url = null;
-          else {
-            const page = b.bySource.get(path);
-            if (page !== undefined) url = page.url + fragment;
-            else url = staticPaths.has(path) ? b.base + '/' + path + fragment : null;
-          }
-        }
-        targets.set(target, url);
+    if (dir !== state.dir) {
+      state.dir = dir;
+      let targets = byDirectory.get(dir);
+      if (targets === undefined) {
+        targets = new Map();
+        byDirectory.set(dir, targets);
       }
-      if (url !== null) return url;
-      b.broken.add(`broken-link ${source.path} -> ${target}`);
-      return target;
-    };
-    const md = renderMarkdown(source.body, link);
-    source.html = md.html;
-    source.toc = md.toc;
-    source.excerpt = md.excerpt;
+      state.targets = targets;
+    }
+    state.brokenPrefix = 'broken-link ' + source.path + ' -> ';
+    renderMarkdown(source, inline, b.slugs, parts);
   }
 }
 
@@ -801,66 +883,69 @@ function collections(b) {
 /** Group tags by slug, then sort them by post count and slug. */
 function tags(b) {
   const bySlug = new Map();
-  const slugs = new Map();
 
   function refsOf(source) {
     const refs = [];
+    if (source.data.tags === undefined || source.data.tags.length === 0) return refs;
     const seen = new Set();
-    for (const name of source.data.tags ?? []) {
-      let slug = slugs.get(name);
-      if (slug === undefined) {
-        slug = slugify(name);
-        slugs.set(name, slug);
-      }
+    for (const name of source.data.tags) {
+      const slug = slugify(name, b.slugs);
       if (seen.has(slug)) continue;
       seen.add(slug);
       let tag = bySlug.get(slug);
       if (source.post) {
         if (tag === undefined) {
-          tag = { name, slug, url: `${b.base}/tags/${slug}/`, posts: [] };
+          tag = { ref: { name, slug, url: `${b.base}/tags/${slug}/` }, posts: [] };
           bySlug.set(slug, tag);
         }
         tag.posts.push(source);
       }
-      refs.push(tag ?? { name, slug, url: '' });
+      refs.push(tag === undefined ? { name, slug, url: '' } : tag.ref);
     }
     return refs;
   }
 
   for (const p of b.posts) p.tagRefs = refsOf(p);
   for (const s of b.sources) if (!s.post) s.tagRefs = refsOf(s);
-  b.tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
+  b.tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.ref.slug, y.ref.slug));
 }
 
 /** A page's link record as templates read it. */
-const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.card.date_long });
+function linkOf(s) {
+  if (s === null) return null;
+  const { title, url, date, date_long } = s.card;
+  return { title, url, date, date_long };
+}
 
 /** A tag as templates read it (its posts as cards). */
-const tagOf = (t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => p.card) });
+const tagOf = (t) => ({ ...t.ref, count: t.posts.length, posts: t.posts.map((p) => p.card) });
 
 /** A post's card, as lists show it. */
 function cardOf(s) {
+  const { title, date, summary } = s.data;
   return {
-    title: s.data.title,
+    title,
     url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
+    date: date ?? '',
+    date_long: date === undefined ? '' : longDate(date),
+    summary: summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: readingMinutes(s.body),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    // Template lookups compute and share this value when a page or card uses it.
+    reading_minutes: s,
+    tags: s.tagRefs,
   };
 }
 
 /** A page as its layout reads it. */
 function pageOf(s) {
+  const { title, url, date, date_long, summary, excerpt, reading_minutes, tags } = s.card;
   return {
-    ...s.card,
+    title, url, date, date_long, summary, excerpt, reading_minutes, tags,
     slug: s.slug,
     content: s.html,
     toc: s.toc,
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
+    newer: linkOf(s.newer),
+    older: linkOf(s.older),
     is_post: s.post,
   };
 }
@@ -869,7 +954,7 @@ function pageOf(s) {
 function layouts(b) {
   for (const s of b.sources) s.card = cardOf(s);
   const site = { title: b.input.site.title, base_url: b.base };
-  const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
+  const allTags = b.tags.map((t) => ({ ...t.ref, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => p.card);
   const compile = buildRenderers(b.templates, { site, tags: allTags, recent });
   const pageRenderers = new Map();
@@ -894,7 +979,7 @@ function layouts(b) {
   }
   const tag = b.tags.length === 0 ? null : compile('tag', ['tag']);
   if (tag !== null) {
-    for (const t of b.tags) b.output[`tags/${t.slug}/index.html`] = tag({ tag: tagOf(t) });
+    for (const t of b.tags) b.output[`tags/${t.ref.slug}/index.html`] = tag({ tag: tagOf(t) });
   }
   const all = compile('tags', []);
   if (all !== null) b.output['tags/index.html'] = all({});
@@ -934,6 +1019,7 @@ export function run(input) {
     sources: [],
     statics: [],
     bySource: new Map(),
+    slugs: new Map(),
     broken: new Set(),
     report,
     posts: [],
@@ -944,24 +1030,12 @@ export function run(input) {
   return b.output;
 }
 
-const BLANK = /^[ \t]*$/;
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-const HR = /^(?:---|\*\*\*)[ \t]*$/;
-const BULLET = /^[-*] (.*)$/;
-const ORDERED = /^(\d{1,9})\. (.*)$/;
-const CONTINUED = /^ {2,}\S/;
-const TRAILING_SPACE = /[ \t]+$/;
-const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
-const ESCAPABLE = "\\`*_[]()#+-.!>";
-
-function trimLine(line) {
-  const first = line.charCodeAt(0);
-  const last = line.charCodeAt(line.length - 1);
-  if (first === 32 || first === 9) line = line.replace(/^[ \t]+/, '');
-  return last === 32 || last === 9 ? line.replace(TRAILING_SPACE, '') : line;
-}
+const FENCE_OPEN = /```([A-Za-z0-9_+-]*)[ \t]*(?=\n|$)/y;
+const HEADING = /(#{1,6})[ \t]+([^ \t\r\n\u2028\u2029][^\r\n\u2028\u2029]*)(?=\n|$)/y;
+const HR = /(?:---|\*\*\*)[ \t]*(?=\n|$)/y;
+const BULLET = /[-*] ([^\r\n\u2028\u2029]*)(?=\n|$)/y;
+const ORDERED = /(\d{1,9})\. ([^\r\n\u2028\u2029]*)(?=\n|$)/y;
+const CONTINUED = / {2,}\S/y;
 
 function escapedAt(s, i, from) {
   let j = i;
@@ -973,193 +1047,253 @@ function findUnescaped(s, what, from, limit) {
   const last = limit - what.length;
   let i = s.indexOf(what, from);
   while (i !== -1 && i <= last) {
-    if (!escapedAt(s, i, from)) return i;
+    if (i === from || s.charCodeAt(i - 1) !== 92 || !escapedAt(s, i, from)) return i;
     i = s.indexOf(what, i + 1);
   }
   return -1;
 }
 
-function findSingleStar(s, from, limit) {
-  let i = s.indexOf('*', from);
-  while (i !== -1 && i < limit) {
-    if (escapedAt(s, i, from)) i = s.indexOf('*', i + 1);
-    else if (i + 1 < limit && s.charCodeAt(i + 1) === 42) i = s.indexOf('*', i + 2);
-    else return i;
+// Each token ends at the first eligible closer, as in the reference grammar.
+const INLINE_TOKEN = new RegExp([
+  /\\[\\`*_\[\]()#+\-.!>]/.source,
+  /`[^`]+`/.source,
+  /\*\*(?!\*\*)[^*\\]*(?:(?:\\[\s\S]|\*(?!\*))[^*\\]*)*\*\*/.source,
+  /\*\*/.source, // Consume an unmatched pair together.
+  /\*(?!\*)[^*\\]*(?:(?:\\[\s\S]|\*\*)[^*\\]*)*\*(?!\*)/.source,
+  /\[[^\]\\]*(?:\\[\s\S][^\]\\]*)*\]\([^\s)]+\)/.source,
+  /[&<>"']/.source,
+].join('|'), 'g');
+
+function inlineRenderer(state) {
+  function inline(text) {
+    return text.replace(INLINE_TOKEN, token);
   }
-  return -1;
+
+  function token(match) {
+    switch (match.charCodeAt(0)) {
+      case 92: return match.charCodeAt(1) === 62 ? '&gt;' : match[1];
+      case 96: return '<code>' + escapeHtml(match.slice(1, -1)) + '</code>';
+      case 42: {
+        if (match.charCodeAt(1) !== 42) return '<em>' + inline(match.slice(1, -1)) + '</em>';
+        if (match.length === 2) return match;
+        return '<strong>' + inline(match.slice(2, -2)) + '</strong>';
+      }
+      case 91: {
+        const close = findUnescaped(match, ']', 1, match.length);
+        return link(match.slice(close + 2, -1), state) + inline(match.slice(1, close)) + '</a>';
+      }
+      default: return ESCAPES[match];
+    }
+  }
+  return inline;
 }
 
-function inline(s, link, start = 0, limit = s.length) {
-  let out = '';
-  let literal = start;
-  let next = start;
-  while (next < limit) {
-    INLINE_SPECIAL.lastIndex = next;
-    if (!INLINE_SPECIAL.test(s)) break;
-    const i = INLINE_SPECIAL.lastIndex - 1;
-    if (i >= limit) break;
-    const mark = s.charCodeAt(i);
-    let text;
-    let end = i + 1;
-    switch (mark) {
-      case 92: { // Backslash escape
-        const next = s[end];
-        if (end < limit && ESCAPABLE.includes(next)) {
-          text = next === '>' ? '&gt;' : next;
-          end++;
-        }
-        break;
-      }
-      case 96: { // Code span
-        const close = s.indexOf('`', end);
-        if (close > end && close < limit) {
-          text = '<code>' + escapeHtml(s.slice(end, close)) + '</code>';
-          end = close + 1;
-        }
-        break;
-      }
-      case 42: { // Strong or emphasis
-        if (end < limit && s.charCodeAt(end) === 42) {
-          end++;
-          const close = findUnescaped(s, '**', end, limit);
-          if (close > end) {
-            text = '<strong>' + inline(s, link, end, close) + '</strong>';
-            end = close + 2;
-          }
-        } else {
-          const close = findSingleStar(s, end, limit);
-          if (close > end) {
-            text = '<em>' + inline(s, link, end, close) + '</em>';
-            end = close + 1;
-          }
-        }
-        break;
-      }
-      case 91: { // Link
-        const close = findUnescaped(s, ']', end, limit);
-        if (close !== -1 && close + 2 < limit && s.charCodeAt(close + 1) === 40) {
-          const targetEnd = s.indexOf(')', close + 2);
-          if (targetEnd > close + 2 && targetEnd < limit) {
-            const target = s.slice(close + 2, targetEnd);
-            if (!/\s/.test(target)) {
-              text = '<a href="' + escapeHtml(link(target)) + '">' + inline(s, link, end, close) + '</a>';
-              end = targetEnd + 1;
-            }
-          }
-        }
-        break;
-      }
-      default:
-        text = ESCAPES[s[i]];
-    }
-    if (text !== undefined) {
-      out += s.slice(literal, i) + text;
-      literal = end;
-    }
-    next = end;
-  }
-  return out + s.slice(literal, limit);
+function lineEnd(src, start) {
+  const end = src.indexOf('\n', start);
+  return end === -1 ? src.length : end;
 }
 
-function endsParagraph(line) {
-  switch (line.charCodeAt(0)) {
-    case 32:
-    case 9:
-      return BLANK.test(line);
+function trimStart(src, start, end) {
+  while (start < end) {
+    const at = start++;
+    const ch = src.charCodeAt(at);
+    if (ch !== 32 && ch !== 9) return at;
+  }
+  return end;
+}
+
+function trimEnd(src, start, end) {
+  while (end > start) {
+    const ch = src.charCodeAt(--end);
+    if (ch !== 32 && ch !== 9) return end + 1;
+  }
+  return start;
+}
+
+function trimLine(src, start, end) {
+  start = trimStart(src, start, end);
+  return src.slice(start, trimEnd(src, start, end));
+}
+
+function isRule(src, start, end, mark) {
+  if (start + 3 > end || src.charCodeAt(start + 1) !== mark || src.charCodeAt(start + 2) !== mark) return false;
+  HR.lastIndex = start;
+  return HR.test(src);
+}
+
+function endsParagraph(src, start, end, marker) {
+  switch (marker) {
     case 96:
-      return FENCE_OPEN.test(line);
-    case 35: {
-      const heading = HEADING.exec(line);
-      return heading !== null && heading[2] !== '';
-    }
+      if (!src.startsWith('```', start)) return false;
+      FENCE_OPEN.lastIndex = start;
+      return FENCE_OPEN.test(src);
+    case 35:
+      HEADING.lastIndex = start;
+      return HEADING.test(src);
     case 45:
+      return isRule(src, start, end, 45);
     case 42:
-      return HR.test(line);
+      return isRule(src, start, end, 42);
     default:
-      return line === '';
+      return false;
   }
 }
 
-function renderMarkdown(src, link) {
-  const lines = src.split('\n');
-  const ids = new Map();
+function renderMarkdown(source, inline, slugs, parts) {
+  const src = source.body;
+  const length = src.length;
+  let out = 0;
   const toc = [];
-  let html = '';
+  let ids;
   let excerpt = null;
-  let i = 0;
+  let next = 0;
 
-  while (i < lines.length) {
-    const line = lines[i++];
-    const marker = line.charCodeAt(0);
-    if (line === '' || ((marker === 32 || marker === 9) && BLANK.test(line))) continue;
+  while (next < length) {
+    const start = next;
+    const marker = src.charCodeAt(start);
+    if (marker === 10) {
+      next++;
+      continue;
+    }
+    const end = lineEnd(src, start);
+    next = end + 1;
+    const leftTrimmed = marker === 32 || marker === 9 ? trimStart(src, start + 1, end) : start;
+    if (leftTrimmed === end) continue;
 
-    if (marker === 96) {
-      const fence = FENCE_OPEN.exec(line);
+    if (marker === 96 && src.startsWith('```', start)) {
+      FENCE_OPEN.lastIndex = start;
+      const fence = FENCE_OPEN.exec(src);
       if (fence !== null) {
-        const start = i;
-        while (i < lines.length && !FENCE_CLOSE.test(lines[i])) i++;
-        const code = i === start ? '' : escapeHtml(lines.slice(start, i).join('\n')) + '\n';
-        const cls = fence[1] === '' ? '' : ' class="language-' + fence[1] + '"';
-        html += '<pre><code' + cls + '>' + code + '</code></pre>\n';
-        i++;
+        const open = fence[1] === '' ? '<pre><code>' : '<pre><code class="language-' + fence[1] + '">';
+        parts[out++] = open;
+        if (next <= src.length) {
+          let close = end;
+          do {
+            close = src.indexOf('\n```', close);
+            if (close === -1) break;
+            const after = lineEnd(src, close + 1);
+            if (trimStart(src, close + 4, after) === after) {
+              next = after + 1;
+              break;
+            }
+            close = after;
+          } while (true);
+          if (close === -1) {
+            parts[out++] = escapeHtml(src.slice(next));
+            parts[out++] = '\n';
+            next = src.length;
+          } else if (close !== end) {
+            parts[out++] = escapeHtml(src.slice(end + 1, close + 1));
+          }
+        }
+        parts[out++] = '</code></pre>\n';
         continue;
       }
     }
 
     if (marker === 35) {
-      const heading = HEADING.exec(line);
-      if (heading !== null && heading[2] !== '') {
+      HEADING.lastIndex = start;
+      const heading = HEADING.exec(src);
+      if (heading !== null) {
+        const raw = heading[2];
+        const title = raw.slice(0, trimEnd(raw, 0, raw.length));
         const level = heading[1].length;
-        const id = uniqueSlug(slugify(heading[2]), ids);
-        const text = inline(heading[2], link);
-        html += '<h' + level + ' id="' + id + '">' + text + '</h' + level + '>\n';
-        if (level === 2 || level === 3) toc.push({ level, id, html: text });
+        const id = uniqueSlug(slugify(title, slugs), ids ??= new Map());
+        const html = inline(title);
+        if (level === 2 || level === 3) toc.push({ level, id, html });
+        parts[out++] = '<h' + level + ' id="' + id + '">' + html + '</h' + level + '>\n';
         continue;
       }
     }
 
-    if ((marker === 45 || marker === 42) && HR.test(line)) {
-      html += '<hr>\n';
+    if ((marker === 45 || marker === 42) && isRule(src, start, end, marker)) {
+      parts[out++] = '<hr>\n';
       continue;
     }
 
     if (marker === 62) {
-      let body = trimLine(line.slice(1));
-      while (i < lines.length && lines[i].charCodeAt(0) === 62) {
-        const part = trimLine(lines[i++].slice(1));
+      let body = trimLine(src, start + 1, end);
+      while (next < src.length && src.charCodeAt(next) === 62) {
+        const stop = lineEnd(src, next);
+        const part = trimLine(src, next + 1, stop);
         if (part !== '') body += body === '' ? part : '\n' + part;
+        next = stop + 1;
       }
-      html += body === '' ? '<blockquote>\n</blockquote>\n' : '<blockquote>\n<p>' + inline(body, link) + '</p>\n</blockquote>\n';
+      if (body === '') parts[out++] = '<blockquote>\n</blockquote>\n';
+      else {
+        parts[out++] = '<blockquote>\n<p>' + inline(body) + '</p>\n</blockquote>\n';
+      }
       continue;
     }
 
-    const bullet = (marker === 45 || marker === 42) && BULLET.exec(line);
-    const ordered = marker >= 48 && marker <= 57 && ORDERED.exec(line);
-    if (bullet || ordered) {
-      const start = ordered ? Number(ordered[1]) : 1;
-      const pattern = ordered ? ORDERED : BULLET;
+    let pattern;
+    if ((marker === 45 || marker === 42) && start + 1 < end && src.charCodeAt(start + 1) === 32) pattern = BULLET;
+    else if (marker >= 48 && marker <= 57) pattern = ORDERED;
+    if (pattern !== undefined) pattern.lastIndex = start;
+    const list = pattern?.exec(src);
+    if (list) {
+      const ordered = pattern === ORDERED;
+      const number = ordered ? Number(list[1]) : 1;
       const group = ordered ? 2 : 1;
-      html += ordered ? (start === 1 ? '<ol>\n' : '<ol start="' + start + '">\n') : '<ul>\n';
-      let item = trimLine((ordered || bullet)[group]);
-      while (i < lines.length) {
-        const next = pattern.exec(lines[i]);
-        if (next !== null) {
-          html += '<li>' + inline(item, link) + '</li>\n';
-          item = trimLine(next[group]);
-        } else if (CONTINUED.test(lines[i])) item += '\n' + trimLine(lines[i]);
-        else break;
-        i++;
+      parts[out++] = ordered ? (number === 1 ? '<ol>\n' : '<ol start="' + number + '">\n') : '<ul>\n';
+      let item = trimLine(list[group], 0, list[group].length);
+      while (next < length) {
+        const ch = src.charCodeAt(next);
+        const followedBySpace = next + 1 < src.length && src.charCodeAt(next + 1) === 32;
+        const otherItem = ordered ? ch >= 48 && ch <= 57 : (ch === 45 || ch === 42) && followedBySpace;
+        if (!otherItem && (ch !== 32 || !followedBySpace)) break;
+        if (otherItem) {
+          pattern.lastIndex = next;
+          const match = pattern.exec(src);
+          if (match === null) break;
+          parts[out++] = '<li>' + inline(item) + '</li>\n';
+          item = trimLine(match[group], 0, match[group].length);
+          next = pattern.lastIndex + 1;
+        } else {
+          CONTINUED.lastIndex = next;
+          if (!CONTINUED.test(src)) break;
+          const stop = lineEnd(src, next);
+          item += '\n' + trimLine(src, next, stop);
+          next = stop + 1;
+        }
       }
-      html += '<li>' + inline(item, link) + '</li>\n' + (ordered ? '</ol>\n' : '</ul>\n');
+      parts[out++] = '<li>' + inline(item) + (ordered ? '</li>\n</ol>\n' : '</li>\n</ul>\n');
       continue;
     }
 
-    let body = trimLine(line);
-    while (i < lines.length && !endsParagraph(lines[i])) body += '\n' + trimLine(lines[i++]);
-    const paragraph = inline(body, link);
-    if (excerpt === null) excerpt = paragraph;
-    html += '<p>' + paragraph + '</p>\n';
+    // Keep untrimmed paragraph lines together as a single slice.
+    let left = leftTrimmed;
+    let right = trimEnd(src, left, end);
+    let body = '';
+    while (next < length) {
+      const mark = src.charCodeAt(next);
+      if (mark === 10) {
+        next++;
+        break;
+      }
+      const stop = lineEnd(src, next);
+      let head = next;
+      if (mark === 32 || mark === 9) {
+        head = trimStart(src, next + 1, stop);
+        if (head === stop) {
+          next = stop + 1;
+          break;
+        }
+      } else if (endsParagraph(src, next, stop, mark)) break;
+      if (right + 1 !== next || head !== next) {
+        body += src.slice(left, right) + '\n';
+        left = head;
+      }
+      right = trimEnd(src, head, stop);
+      next = stop + 1;
+    }
+    const html = inline(body + src.slice(left, right));
+    if (excerpt === null) excerpt = html;
+    parts[out++] = '<p>' + html + '</p>\n';
   }
 
-  return { html, toc, excerpt: excerpt ?? '' };
+  parts.length = out;
+  source.html = parts.join('');
+  source.toc = toc;
+  source.excerpt = excerpt ?? '';
 }
