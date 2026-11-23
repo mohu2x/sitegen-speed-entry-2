@@ -1,13 +1,11 @@
-import { closeSync, openSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { setFlagsFromString } from 'node:v8';
+const { closeSync, openSync, readFileSync, writeFileSync } = require('node:fs');
+const { join } = require('node:path');
+const { setFlagsFromString } = require('node:v8');
 
 // Avoid the optimizing compiler's CPU cost during the three-case cold run.
-setFlagsFromString('--no-incremental-marking --no-turbofan');
+setFlagsFromString('--no-incremental-marking --no-turbofan --single-threaded-gc --no-parallel-scavenge --semi-space-growth-factor=8');
 
-type FileValue = string | number | boolean | null;
-type OutputTree = Record<string, FileValue>;
-const { run } = (await import('./solve.js')) as { run: (input: unknown) => OutputTree };
+const { run } = require('./solve.js');
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -16,13 +14,13 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const NEEDS_ESCAPE = /["\\\x00-\x1f\ud800-\udfff]/u;
 const MIN_CHUNK_BYTES = 64 * 1024;
 
-function scalarToken(value: number | boolean | null): string {
+function scalarToken(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'null';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   return 'null';
 }
 
-function serialize(tree: OutputTree): Buffer {
+function serialize(tree) {
   const keys = Object.keys(tree);
   let estimate = 2 + keys.length * 6;
   for (const key of keys) {
@@ -32,10 +30,10 @@ function serialize(tree: OutputTree): Buffer {
 
   let buffer = Buffer.allocUnsafe(estimate + Math.ceil(estimate / 8));
   let offset = 0;
-  const chunks: Buffer[] = [];
+  const chunks = [];
   let sealedBytes = 0;
 
-  function reserve(bytes: number) {
+  function reserve(bytes) {
     if (offset + bytes <= buffer.length) return;
     chunks.push(buffer.subarray(0, offset));
     sealedBytes += offset;
@@ -43,7 +41,7 @@ function serialize(tree: OutputTree): Buffer {
     offset = 0;
   }
 
-  function writeString(text: string) {
+  function writeString(text) {
     const raw = !NEEDS_ESCAPE.test(text);
     const token = raw ? text : JSON.stringify(text);
     // Keep room for quotes on the bulk-copy path and punctuation after the token.
@@ -80,7 +78,7 @@ function serialize(tree: OutputTree): Buffer {
   return Buffer.concat(chunks, sealedBytes + offset);
 }
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json')).toString('utf8')) as { input: unknown }[];
+const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json')).toString('utf8'));
 const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
 try {
   writeFileSync(fd, '[');
