@@ -16,6 +16,9 @@ WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEM
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
+
+export { run };
+
 // makefun-site's text rules: the HTML escape table, the slug rule and the long date (README-reference.md, "Text").
 
 /** The HTML escape table, in this order: & < > " ' (README.md). */
@@ -438,6 +441,12 @@ function renderNodes(nodes, scope, templates, depth, limit) {
 
 // Resolve lexical bindings and visible roots once per layout. Includes share
 // those bindings and are expanded up to the dialect's include-depth limit.
+const PAGE_FIELDS = new Set([
+  'title', 'url', 'date', 'date_long', 'summary', 'excerpt', 'tags',
+  'slug', 'content', 'toc', 'newer', 'older', 'is_post',
+]);
+const SAFE_PAGE_TEXT = new Set(['slug', 'date', 'date_long']);
+
 function compileTemplate(nodes, templates, globals, fields, escaped, fragments, startDepth = 0) {
   const limit = { remaining: 12000 };
   let nextVar = 0;
@@ -445,7 +454,9 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
   const source = [];
   const pending = [];
   const usedBindings = new Set();
-  const roots = new Map(fields.map((key) => [key, 'root.' + key]));
+  const roots = new Map(fields.map((key, index) => [key, 'root' + index]));
+
+  const pageBinding = startDepth === 0 && fields[0] === 'page' ? roots.get('page') : null;
 
   function expression(path, bindings) {
     let expr = bindings.get(path[0]);
@@ -456,10 +467,22 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
       const index = fixed.push(value) - 1;
       return 'fixed[' + index + ']';
     }
+    if (expr[0] === 'l' && path.length >= 2) {
+      const key = path[1];
+      if (path.length > 2) return 'undefined';
+      const suffix = expr.slice(1);
+      if (key === 'index') return '(i' + suffix + '+1)';
+      if (key === 'first') return '(i' + suffix + '===0)';
+      if (key === 'last') return '(i' + suffix + '===n' + suffix + '-1)';
+      if (key === 'length') return 'n' + suffix;
+      return 'undefined';
+    }
     usedBindings.add(expr);
     for (let i = 1; i < path.length; i++) {
       const key = path[i];
-      expr = key === 'reading_minutes' ? 'readingOf(' + expr + ')' : 'own(' + expr + ',' + JSON.stringify(key) + ')';
+      if (key === 'reading_minutes') expr = 'readingOf(' + expr + ')';
+      else if (i === 1 && expr === pageBinding && PAGE_FIELDS.has(key)) expr += '.' + key;
+      else expr = 'own(' + expr + ',' + JSON.stringify(key) + ')';
     }
     return expr;
   }
@@ -512,7 +535,10 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
           const convert = node.kind === 'var' ? 'escaped' : 'textOf';
           if (value === DYNAMIC) {
             flushLiteral();
-            pending.push(convert + '(' + expression(node.path, bindings) + ')');
+            const expr = expression(node.path, bindings);
+            const isPage = bindings.get(node.path[0]) === pageBinding;
+            const safe = isPage && node.path.length === 2 && (SAFE_PAGE_TEXT.has(node.path[1]) || (node.kind === 'raw' && node.path[1] === 'content'));
+            pending.push(safe ? expr : convert + '(' + expr + ')');
           } else {
             literal += node.kind === 'var' ? escaped(value) : textOf(value);
           }
@@ -583,12 +609,15 @@ function compileTemplate(nodes, templates, globals, fields, escaped, fragments, 
     if (source.length === 0 && pending.length === 0) return () => literal;
     flush();
     const factory = new Function('own', 'readingOf', 'textOf', 'escaped', 'truthy', 'loopInfo', 'fixed',
-      '"use strict";return function render(root){let out="";\n' + source.join('\n') + '\nreturn out;}');
+      '"use strict";return function render(' + [...roots.values()].join(',') + '){let out="";\n' + source.join('\n') + '\nreturn out;}');
     return factory(own, readingOf, textOf, escaped, truthy, loopInfo, fixed);
   } catch (err) {
     if (err !== COMPILE_LIMIT && !(err instanceof RangeError) && !(err instanceof SyntaxError)) throw err;
     const parent = { vars: globals, parent: null };
-    return (vars) => renderNodes(nodes, { vars, parent }, templates, startDepth, null);
+    return (...values) => {
+      const vars = Object.fromEntries(fields.map((key, index) => [key, values[index]]));
+      return renderNodes(nodes, { vars, parent }, templates, startDepth, null);
+    };
   }
 }
 
@@ -646,10 +675,10 @@ function fragmentCache(templates, globals, escaped) {
         const evaluate = compileTemplate(nodes, templates, globals, [field], escaped, undefined, depth);
         const rendered = new WeakMap();
         render = (value) => {
-          if (value === null || typeof value !== 'object') return evaluate({ [field]: value });
+          if (value === null || typeof value !== 'object') return evaluate(value);
           let html = rendered.get(value);
           if (html === undefined) {
-            html = evaluate({ [field]: value });
+            html = evaluate(value);
             rendered.set(value, html);
           }
           return html;
@@ -689,33 +718,19 @@ const RESERVED = Object.freeze(['posts', 'tags', 'page']);
 /** Code-unit order (never the locale's). */
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-// Every ECMAScript whitespace or line-terminator code unit.
-const WORD_SPACE = new Uint8Array(65536);
-for (const ch of ' \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff') {
-  WORD_SPACE[ch.charCodeAt(0)] = 1;
-}
+const FIRST_WORD = /\S/;
+// Each match consumes up to 200 whole words and their trailing whitespace.
+const WORD_BATCH = /(?:\S+\s*){1,200}/y;
 
 function readingMinutes(text) {
-  const length = text.length;
-  // Even alternating one-character words and separators cannot exceed 200.
-  if (length <= 399) return 1;
-  let words = 0;
-  let separated = 1;
-  let i = 0;
-  for (; i + 4 <= length; i += 4) {
-    const a = WORD_SPACE[text.charCodeAt(i)];
-    const b = WORD_SPACE[text.charCodeAt(i + 1)];
-    const c = WORD_SPACE[text.charCodeAt(i + 2)];
-    const d = WORD_SPACE[text.charCodeAt(i + 3)];
-    words += (separated & (a ^ 1)) + (a & (b ^ 1)) + (b & (c ^ 1)) + (c & (d ^ 1));
-    separated = d;
-  }
-  for (; i < length; i++) {
-    const space = WORD_SPACE[text.charCodeAt(i)];
-    words += separated & (space ^ 1);
-    separated = space;
-  }
-  return Math.max(1, Math.ceil(words / 200));
+  // Even alternating one-character words and separators fit in one minute.
+  if (text.length <= 399) return 1;
+  const first = text.search(FIRST_WORD);
+  if (first === -1) return 1;
+  WORD_BATCH.lastIndex = first;
+  let minutes = 0;
+  while (WORD_BATCH.test(text)) minutes++;
+  return minutes;
 }
 
 const PATH_SEGMENT = /(?:^|\/)\.{1,2}(?:\/|$)|\/$|\/\//;
@@ -850,10 +865,9 @@ function link(target, state) {
 function markdown(b) {
   const staticPaths = new Set(b.statics.map((f) => f.path));
   const byDirectory = new Map();
-  const parts = [];
   const state = { b, staticPaths, dir: null, targets: null, brokenPrefix: '' };
 
-  const inline = inlineRenderer(state);
+  const writer = { html: '', ids: null, toc: null, excerpt: null, inline: inlineRenderer(state), slugs: b.slugs };
   for (const source of b.sources) {
     const dir = source.dir;
     if (dir !== state.dir) {
@@ -866,47 +880,52 @@ function markdown(b) {
       state.targets = targets;
     }
     state.brokenPrefix = 'broken-link ' + source.path + ' -> ';
-    renderMarkdown(source, inline, b.slugs, parts);
+    renderMarkdown(source, writer);
   }
 }
 
-/** Sort posts by date and slug, and assign their neighbors. */
+/** Sort posts, assign their neighbors, and collect tags in post order. */
 function collections(b) {
   const posts = b.posts;
   posts.sort((x, y) => byCodeUnits(y.data.date, x.data.date) || byCodeUnits(x.slug, y.slug));
-  posts.forEach((p, k) => {
-    p.newer = k === 0 ? null : posts[k - 1];
-    p.older = k === posts.length - 1 ? null : posts[k + 1];
-  });
-}
-
-/** Group tags by slug, then sort them by post count and slug. */
-function tags(b) {
   const bySlug = new Map();
-
-  function refsOf(source) {
-    const refs = [];
-    if (source.data.tags === undefined || source.data.tags.length === 0) return refs;
-    const seen = new Set();
-    for (const name of source.data.tags) {
+  let newer = null;
+  for (const post of posts) {
+    post.newer = newer;
+    if (newer !== null) newer.older = post;
+    newer = post;
+    const refs = post.tagRefs = [];
+    post.card = cardOf(post);
+    const names = post.data.tags;
+    if (names === undefined) continue;
+    for (const name of names) {
       const slug = slugify(name, b.slugs);
-      if (seen.has(slug)) continue;
-      seen.add(slug);
       let tag = bySlug.get(slug);
-      if (source.post) {
-        if (tag === undefined) {
-          tag = { ref: { name, slug, url: `${b.base}/tags/${slug}/` }, posts: [] };
-          bySlug.set(slug, tag);
-        }
-        tag.posts.push(source);
+      if (tag === undefined) {
+        tag = { ref: { name, slug, url: b.base + '/tags/' + slug + '/' }, posts: [], last: null };
+        bySlug.set(slug, tag);
       }
-      refs.push(tag === undefined ? { name, slug, url: '' } : tag.ref);
+      if (tag.last === post) continue;
+      tag.last = post;
+      tag.posts.push(post.card);
+      refs.push(tag.ref);
     }
-    return refs;
   }
-
-  for (const p of b.posts) p.tagRefs = refsOf(p);
-  for (const s of b.sources) if (!s.post) s.tagRefs = refsOf(s);
+  for (const page of b.sources) {
+    if (page.post) continue;
+    const refs = page.tagRefs = [];
+    const names = page.data.tags;
+    if (names !== undefined) {
+      const seen = new Set();
+      for (const name of names) {
+        const slug = slugify(name, b.slugs);
+        if (seen.has(slug)) continue;
+        seen.add(slug);
+        refs.push(bySlug.get(slug)?.ref ?? { name, slug, url: '' });
+      }
+    }
+    page.card = cardOf(page);
+  }
   b.tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.ref.slug, y.ref.slug));
 }
 
@@ -918,7 +937,7 @@ function linkOf(s) {
 }
 
 /** A tag as templates read it (its posts as cards). */
-const tagOf = (t) => ({ ...t.ref, count: t.posts.length, posts: t.posts.map((p) => p.card) });
+const tagOf = (t) => ({ ...t.ref, count: t.posts.length, posts: t.posts });
 
 /** A post's card, as lists show it. */
 function cardOf(s) {
@@ -952,7 +971,6 @@ function pageOf(s) {
 
 /** Render the layouts and add any static files they leave unshadowed. */
 function layouts(b) {
-  for (const s of b.sources) s.card = cardOf(s);
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ ...t.ref, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => p.card);
@@ -964,25 +982,25 @@ function layouts(b) {
       render = compile(source.layout, ['page']);
       pageRenderers.set(source.layout, render);
     }
-    b.output[source.outDir + '/index.html'] = render({ page: pageOf(source) });
+    b.output[source.outDir + '/index.html'] = render(pageOf(source));
   }
   const index = compile('index', ['posts', 'pager']);
   const per = b.input.site.per_page;
   const pages = Math.max(1, Math.ceil(b.posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${b.base}/` : `${b.base}/page/${k}/`);
   for (let k = 1; index !== null && k <= pages; k++) {
-    const html = index({
-      posts: b.posts.slice((k - 1) * per, k * per).map((p) => p.card),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
+    const posts = b.posts.slice((k - 1) * per, k * per);
+    for (let i = 0; i < posts.length; i++) posts[i] = posts[i].card;
+    const pager = { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) };
+    const html = index(posts, pager);
     b.output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   const tag = b.tags.length === 0 ? null : compile('tag', ['tag']);
   if (tag !== null) {
-    for (const t of b.tags) b.output[`tags/${t.ref.slug}/index.html`] = tag({ tag: tagOf(t) });
+    for (const t of b.tags) b.output[`tags/${t.ref.slug}/index.html`] = tag(tagOf(t));
   }
   const all = compile('tags', []);
-  if (all !== null) b.output['tags/index.html'] = all({});
+  if (all !== null) b.output['tags/index.html'] = all();
   for (const f of b.statics) {
     if (Object.hasOwn(b.output, f.path)) b.report.push(`shadowed ${f.path}: a built page has its path`);
     else b.output[f.path] = f.content;
@@ -998,10 +1016,10 @@ function report(b) {
 }
 
 /** Build stages in dependency order. */
-const PIPELINE = [readSources, markdown, collections, tags, layouts, report];
+const PIPELINE = [readSources, markdown, collections, layouts, report];
 
 /** One site's output tree: path -> text. */
-export function run(input) {
+function run(input) {
   const templates = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
@@ -1033,8 +1051,8 @@ export function run(input) {
 const FENCE_OPEN = /```([A-Za-z0-9_+-]*)[ \t]*(?=\n|$)/y;
 const HEADING = /(#{1,6})[ \t]+([^ \t\r\n\u2028\u2029][^\r\n\u2028\u2029]*)(?=\n|$)/y;
 const HR = /(?:---|\*\*\*)[ \t]*(?=\n|$)/y;
-const BULLET = /[-*] ([^\r\n\u2028\u2029]*)(?=\n|$)/y;
-const ORDERED = /(\d{1,9})\. ([^\r\n\u2028\u2029]*)(?=\n|$)/y;
+const BULLET = /[-*] [^\r\n\u2028\u2029]*(?=\n|$)/y;
+const ORDERED = /\d{1,9}\. [^\r\n\u2028\u2029]*(?=\n|$)/y;
 const CONTINUED = / {2,}\S/y;
 
 function escapedAt(s, i, from) {
@@ -1070,6 +1088,8 @@ function inlineRenderer(state) {
   }
 
   function token(match) {
+    // Only the HTML entity branch of INLINE_TOKEN matches one character.
+    if (match.length === 1) return ESCAPES[match];
     switch (match.charCodeAt(0)) {
       case 92: return match.charCodeAt(1) === 62 ? '&gt;' : match[1];
       case 96: return '<code>' + escapeHtml(match.slice(1, -1)) + '</code>';
@@ -1082,7 +1102,7 @@ function inlineRenderer(state) {
         const close = findUnescaped(match, ']', 1, match.length);
         return link(match.slice(close + 2, -1), state) + inline(match.slice(1, close)) + '</a>';
       }
-      default: return ESCAPES[match];
+      default: return match;
     }
   }
   return inline;
@@ -1139,13 +1159,130 @@ function endsParagraph(src, start, end, marker) {
   }
 }
 
-function renderMarkdown(source, inline, slugs, parts) {
+function writeFence(src, end, next, lang, writer) {
+  const open = lang === '' ? '<pre><code>' : '<pre><code class="language-' + lang + '">';
+  writer.html += open;
+  if (next <= src.length) {
+    let close = end;
+    do {
+      close = src.indexOf('\n```', close);
+      if (close === -1) break;
+      const after = lineEnd(src, close + 1);
+      if (trimStart(src, close + 4, after) === after) {
+        next = after + 1;
+        break;
+      }
+      close = after;
+    } while (true);
+    if (close === -1) {
+      writer.html += escapeHtml(src.slice(next));
+      writer.html += '\n';
+      next = src.length;
+    } else if (close !== end) {
+      writer.html += escapeHtml(src.slice(end + 1, close + 1));
+    }
+  }
+  writer.html += '</code></pre>\n';
+  return next;
+}
+
+function writeList(src, start, end, next, pattern, writer) {
+  const length = src.length;
+  const ordered = pattern === ORDERED;
+  const separator = ordered ? src.indexOf('.', start) : start;
+  const number = ordered ? Number(src.slice(start, separator)) : 1;
+  writer.html += ordered ? (number === 1 ? '<ol>\n' : '<ol start="' + number + '">\n') : '<ul>\n';
+  let item = trimLine(src, separator + 2, end);
+  while (next < length) {
+    const ch = src.charCodeAt(next);
+    const followedBySpace = next + 1 < src.length && src.charCodeAt(next + 1) === 32;
+    const otherItem = ordered ? ch >= 48 && ch <= 57 : (ch === 45 || ch === 42) && followedBySpace;
+    if (!otherItem && (ch !== 32 || !followedBySpace)) break;
+    if (otherItem) {
+      pattern.lastIndex = next;
+      if (!pattern.test(src)) break;
+      writer.html += '<li>' + writer.inline(item) + '</li>\n';
+      const separator = ordered ? src.indexOf('.', next) : next;
+      item = trimLine(src, separator + 2, pattern.lastIndex);
+      next = pattern.lastIndex + 1;
+    } else {
+      CONTINUED.lastIndex = next;
+      if (!CONTINUED.test(src)) break;
+      const stop = lineEnd(src, next);
+      item += '\n' + trimLine(src, next, stop);
+      next = stop + 1;
+    }
+  }
+  writer.html += '<li>' + writer.inline(item) + (ordered ? '</li>\n</ol>\n' : '</li>\n</ul>\n');
+  return next;
+}
+
+function writeHeading(heading, writer) {
+  const raw = heading[2];
+  const title = raw.slice(0, trimEnd(raw, 0, raw.length));
+  const level = heading[1].length;
+  const id = uniqueSlug(slugify(title, writer.slugs), writer.ids ??= new Map());
+  const html = writer.inline(title);
+  if (level === 2 || level === 3) writer.toc.push({ level, id, html });
+  writer.html += '<h' + level + ' id="' + id + '">' + html + '</h' + level + '>\n';
+}
+
+function writeQuote(src, start, end, next, writer) {
+  let body = trimLine(src, start + 1, end);
+  while (next < src.length && src.charCodeAt(next) === 62) {
+    const stop = lineEnd(src, next);
+    const part = trimLine(src, next + 1, stop);
+    if (part !== '') body += body === '' ? part : '\n' + part;
+    next = stop + 1;
+  }
+  if (body === '') writer.html += '<blockquote>\n</blockquote>\n';
+  else {
+    writer.html += '<blockquote>\n<p>' + writer.inline(body) + '</p>\n</blockquote>\n';
+  }
+  return next;
+}
+
+function writeParagraph(src, leftTrimmed, end, next, writer) {
+  const length = src.length;
+  // Keep untrimmed paragraph lines together as a single slice.
+  let left = leftTrimmed;
+  let right = trimEnd(src, left, end);
+  let body = '';
+  while (next < length) {
+    const mark = src.charCodeAt(next);
+    if (mark === 10) {
+      next++;
+      break;
+    }
+    const stop = lineEnd(src, next);
+    let head = next;
+    if (mark === 32 || mark === 9) {
+      head = trimStart(src, next + 1, stop);
+      if (head === stop) {
+        next = stop + 1;
+        break;
+      }
+    } else if (endsParagraph(src, next, stop, mark)) break;
+    if (right + 1 !== next || head !== next) {
+      body += src.slice(left, right) + '\n';
+      left = head;
+    }
+    right = trimEnd(src, head, stop);
+    next = stop + 1;
+  }
+  const html = writer.inline(body + src.slice(left, right));
+  if (writer.excerpt === null) writer.excerpt = html;
+  writer.html += '<p>' + html + '</p>\n';
+  return next;
+}
+
+function renderMarkdown(source, writer) {
   const src = source.body;
   const length = src.length;
-  let out = 0;
-  const toc = [];
-  let ids;
-  let excerpt = null;
+  writer.html = '';
+  writer.toc = [];
+  writer.ids = null;
+  writer.excerpt = null;
   let next = 0;
 
   while (next < length) {
@@ -1164,29 +1301,7 @@ function renderMarkdown(source, inline, slugs, parts) {
       FENCE_OPEN.lastIndex = start;
       const fence = FENCE_OPEN.exec(src);
       if (fence !== null) {
-        const open = fence[1] === '' ? '<pre><code>' : '<pre><code class="language-' + fence[1] + '">';
-        parts[out++] = open;
-        if (next <= src.length) {
-          let close = end;
-          do {
-            close = src.indexOf('\n```', close);
-            if (close === -1) break;
-            const after = lineEnd(src, close + 1);
-            if (trimStart(src, close + 4, after) === after) {
-              next = after + 1;
-              break;
-            }
-            close = after;
-          } while (true);
-          if (close === -1) {
-            parts[out++] = escapeHtml(src.slice(next));
-            parts[out++] = '\n';
-            next = src.length;
-          } else if (close !== end) {
-            parts[out++] = escapeHtml(src.slice(end + 1, close + 1));
-          }
-        }
-        parts[out++] = '</code></pre>\n';
+        next = writeFence(src, end, next, fence[1], writer);
         continue;
       }
     }
@@ -1195,34 +1310,18 @@ function renderMarkdown(source, inline, slugs, parts) {
       HEADING.lastIndex = start;
       const heading = HEADING.exec(src);
       if (heading !== null) {
-        const raw = heading[2];
-        const title = raw.slice(0, trimEnd(raw, 0, raw.length));
-        const level = heading[1].length;
-        const id = uniqueSlug(slugify(title, slugs), ids ??= new Map());
-        const html = inline(title);
-        if (level === 2 || level === 3) toc.push({ level, id, html });
-        parts[out++] = '<h' + level + ' id="' + id + '">' + html + '</h' + level + '>\n';
+        writeHeading(heading, writer);
         continue;
       }
     }
 
     if ((marker === 45 || marker === 42) && isRule(src, start, end, marker)) {
-      parts[out++] = '<hr>\n';
+      writer.html += '<hr>\n';
       continue;
     }
 
     if (marker === 62) {
-      let body = trimLine(src, start + 1, end);
-      while (next < src.length && src.charCodeAt(next) === 62) {
-        const stop = lineEnd(src, next);
-        const part = trimLine(src, next + 1, stop);
-        if (part !== '') body += body === '' ? part : '\n' + part;
-        next = stop + 1;
-      }
-      if (body === '') parts[out++] = '<blockquote>\n</blockquote>\n';
-      else {
-        parts[out++] = '<blockquote>\n<p>' + inline(body) + '</p>\n</blockquote>\n';
-      }
+      next = writeQuote(src, start, end, next, writer);
       continue;
     }
 
@@ -1230,70 +1329,15 @@ function renderMarkdown(source, inline, slugs, parts) {
     if ((marker === 45 || marker === 42) && start + 1 < end && src.charCodeAt(start + 1) === 32) pattern = BULLET;
     else if (marker >= 48 && marker <= 57) pattern = ORDERED;
     if (pattern !== undefined) pattern.lastIndex = start;
-    const list = pattern?.exec(src);
-    if (list) {
-      const ordered = pattern === ORDERED;
-      const number = ordered ? Number(list[1]) : 1;
-      const group = ordered ? 2 : 1;
-      parts[out++] = ordered ? (number === 1 ? '<ol>\n' : '<ol start="' + number + '">\n') : '<ul>\n';
-      let item = trimLine(list[group], 0, list[group].length);
-      while (next < length) {
-        const ch = src.charCodeAt(next);
-        const followedBySpace = next + 1 < src.length && src.charCodeAt(next + 1) === 32;
-        const otherItem = ordered ? ch >= 48 && ch <= 57 : (ch === 45 || ch === 42) && followedBySpace;
-        if (!otherItem && (ch !== 32 || !followedBySpace)) break;
-        if (otherItem) {
-          pattern.lastIndex = next;
-          const match = pattern.exec(src);
-          if (match === null) break;
-          parts[out++] = '<li>' + inline(item) + '</li>\n';
-          item = trimLine(match[group], 0, match[group].length);
-          next = pattern.lastIndex + 1;
-        } else {
-          CONTINUED.lastIndex = next;
-          if (!CONTINUED.test(src)) break;
-          const stop = lineEnd(src, next);
-          item += '\n' + trimLine(src, next, stop);
-          next = stop + 1;
-        }
-      }
-      parts[out++] = '<li>' + inline(item) + (ordered ? '</li>\n</ol>\n' : '</li>\n</ul>\n');
+    if (pattern !== undefined && pattern.test(src)) {
+      next = writeList(src, start, end, next, pattern, writer);
       continue;
     }
 
-    // Keep untrimmed paragraph lines together as a single slice.
-    let left = leftTrimmed;
-    let right = trimEnd(src, left, end);
-    let body = '';
-    while (next < length) {
-      const mark = src.charCodeAt(next);
-      if (mark === 10) {
-        next++;
-        break;
-      }
-      const stop = lineEnd(src, next);
-      let head = next;
-      if (mark === 32 || mark === 9) {
-        head = trimStart(src, next + 1, stop);
-        if (head === stop) {
-          next = stop + 1;
-          break;
-        }
-      } else if (endsParagraph(src, next, stop, mark)) break;
-      if (right + 1 !== next || head !== next) {
-        body += src.slice(left, right) + '\n';
-        left = head;
-      }
-      right = trimEnd(src, head, stop);
-      next = stop + 1;
-    }
-    const html = inline(body + src.slice(left, right));
-    if (excerpt === null) excerpt = html;
-    parts[out++] = '<p>' + html + '</p>\n';
+    next = writeParagraph(src, leftTrimmed, end, next, writer);
   }
 
-  parts.length = out;
-  source.html = parts.join('');
-  source.toc = toc;
-  source.excerpt = excerpt ?? '';
+  source.html = writer.html;
+  source.toc = writer.toc;
+  source.excerpt = writer.excerpt ?? '';
 }
